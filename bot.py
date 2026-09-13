@@ -1,6 +1,8 @@
 import os
 import logging
 import requests
+import time
+import json
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -13,32 +15,88 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 KIE_API_KEY = os.environ.get("KIE_API_KEY", "")
 
+KIE_BASE = "https://api.kie.ai/api/v1"
+
 KIE_MODELS = {
     "gpt25": {
         "name": "GPT 2.5 Image",
-        "model": "gpt-image-1",
+        "model": "gpt-image-2-text-to-image",
         "desc": "Chất lượng cao nhất"
     },
     "seedream": {
         "name": "Seedream 5 Pro",
-        "model": "seedream-3-0",
+        "model": "seedream-3-0-text-to-image",
         "desc": "Nhanh, sáng tạo"
     },
     "nano": {
         "name": "Nano Banana Pro",
-        "model": "nano-banana-pro",
+        "model": "nano-banana-2",
         "desc": "Draft nhanh"
     }
 }
 
 TOTTY_STYLE = (
-    "Style: Professional Vietnamese children's nutrition brand. "
+    "Professional Vietnamese children's nutrition brand design. "
     "Brand colors: Blue #0050b6, Teal #00bbb6, Orange #ff9d1b. "
     "Clean, modern, premium, warm and friendly. "
-    "Square format 1:1. Brand name: TOTTY."
+    "Square format 1:1. Brand name: TOTTY. Tagline: Nuoi con that de."
 )
 
 CHOOSE_MODEL, ENTER_PROMPT = range(2)
+
+
+def kie_headers():
+    return {
+        "Authorization": f"Bearer {KIE_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+
+def create_task(model_str, prompt):
+    payload = {
+        "model": model_str,
+        "input": {
+            "prompt": prompt,
+            "nsfw_checker": False
+        }
+    }
+    resp = requests.post(
+        f"{KIE_BASE}/jobs/createTask",
+        headers=kie_headers(),
+        json=payload,
+        timeout=30
+    )
+    logger.info(f"createTask status: {resp.status_code}, body: {resp.text[:300]}")
+    data = resp.json()
+    if data.get("code") == 200:
+        return data["data"]["taskId"]
+    raise Exception(f"createTask failed: {data.get('msg')} | {resp.text[:200]}")
+
+
+def poll_task(task_id, max_wait=300):
+    for _ in range(max_wait // 3):
+        time.sleep(3)
+        resp = requests.get(
+            f"{KIE_BASE}/jobs/recordInfo",
+            headers=kie_headers(),
+            params={"taskId": task_id},
+            timeout=30
+        )
+        data = resp.json()
+        logger.info(f"poll state: {data.get('data', {}).get('state')} | taskId: {task_id}")
+        if data.get("code") != 200:
+            raise Exception(f"Poll error: {data.get('msg')}")
+        record = data["data"]
+        state = record.get("state")
+        if state == "success":
+            result_json = json.loads(record.get("resultJson", "{}"))
+            urls = result_json.get("resultUrls", [])
+            if urls:
+                return urls[0]
+            raise Exception("No resultUrls in response")
+        elif state == "fail":
+            raise Exception(f"Task failed: {record.get('failMsg', 'unknown')}")
+    raise Exception("Timeout — ảnh mất quá 5 phút")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -50,9 +108,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def design(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("⭐ GPT 2.5 Image", callback_data="model_gpt25")],
-        [InlineKeyboardButton("🚀 Seedream 5 Pro", callback_data="model_seedream")],
-        [InlineKeyboardButton("⚡ Nano Banana Pro", callback_data="model_nano")],
+        [InlineKeyboardButton("⭐ GPT 2.5 Image — Chất lượng cao", callback_data="model_gpt25")],
+        [InlineKeyboardButton("🚀 Seedream 5 Pro — Nhanh & sáng tạo", callback_data="model_seedream")],
+        [InlineKeyboardButton("⚡ Nano Banana — Draft nhanh", callback_data="model_nano")],
     ]
     await update.message.reply_text(
         "🎨 *Chọn model tạo ảnh:*",
@@ -71,7 +129,7 @@ async def choose_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         f"✅ Đã chọn: *{model_name}*\n\n"
         f"Mô tả ảnh anh muốn tạo:\n\n"
-        f"*Ví dụ:* `Khung ảnh sự kiện sinh nhật Boben Baby, logo Totty, tone xanh`",
+        f"*Ví dụ:* `Khung ảnh sự kiện sinh nhật Boben Baby Thái Nguyên, logo Totty, tone xanh`",
         parse_mode="Markdown"
     )
     return ENTER_PROMPT
@@ -83,99 +141,30 @@ async def generate_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     model_info = KIE_MODELS[model_key]
 
     msg = await update.message.reply_text(
-        f"⏳ Đang tạo ảnh với *{model_info['name']}*...",
+        f"⏳ Đang tạo ảnh với *{model_info['name']}*...\nThường mất 30–90 giây.",
         parse_mode="Markdown"
     )
 
     full_prompt = f"{user_prompt}. {TOTTY_STYLE}"
 
     try:
-        headers = {
-            "Authorization": f"Bearer {KIE_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": model_info["model"],
-            "prompt": full_prompt,
-            "n": 1,
-            "size": "1024x1024"
-        }
+        task_id = create_task(model_info["model"], full_prompt)
+        logger.info(f"Task created: {task_id}")
 
-        response = requests.post(
-            "https://api.kie.ai/v1/images/generations",
-            headers=headers,
-            json=payload,
-            timeout=60
+        await msg.edit_text(
+            f"⏳ Task đã tạo, đang chờ KIE render...\n`{task_id[:16]}...`",
+            parse_mode="Markdown"
         )
 
-        logger.info(f"KIE status: {response.status_code}")
-        logger.info(f"KIE response: {response.text[:500]}")
+        image_url = poll_task(task_id)
 
-        if response.status_code != 200:
-            await update.message.reply_text(
-                f"❌ Lỗi {response.status_code}: {response.text[:200]}"
-            )
-            await msg.delete()
-            return ConversationHandler.END
+        await context.bot.send_photo(
+            chat_id=update.effective_chat.id,
+            photo=image_url,
+            caption=f"✅ *{model_info['name']}*\n_{user_prompt}_\n\nGõ /design để tạo tiếp.",
+            parse_mode="Markdown"
+        )
 
-        data = response.json()
-
-        # Xử lý nhiều dạng response khác nhau của KIE
-        image_url = None
-
-        if isinstance(data, dict):
-            # Dạng: {"data": [{"url": "..."}]}
-            if "data" in data and isinstance(data["data"], list):
-                first = data["data"][0]
-                if isinstance(first, dict):
-                    image_url = first.get("url") or first.get("b64_json")
-                elif isinstance(first, str):
-                    image_url = first
-
-            # Dạng: {"url": "..."}
-            elif "url" in data:
-                image_url = data["url"]
-
-            # Dạng: {"images": ["url1"]}
-            elif "images" in data and isinstance(data["images"], list):
-                image_url = data["images"][0]
-
-            # Dạng: {"result": "url"}
-            elif "result" in data:
-                image_url = data["result"]
-
-        elif isinstance(data, list):
-            first = data[0]
-            if isinstance(first, dict):
-                image_url = first.get("url")
-            elif isinstance(first, str):
-                image_url = first
-
-        if image_url:
-            if image_url.startswith("http"):
-                await context.bot.send_photo(
-                    chat_id=update.effective_chat.id,
-                    photo=image_url,
-                    caption=f"✅ *{model_info['name']}*\n_{user_prompt}_\n\nGõ /design để tạo tiếp.",
-                    parse_mode="Markdown"
-                )
-            else:
-                # base64
-                import base64
-                img_bytes = base64.b64decode(image_url)
-                await context.bot.send_photo(
-                    chat_id=update.effective_chat.id,
-                    photo=img_bytes,
-                    caption=f"✅ *{model_info['name']}*\n_{user_prompt}_",
-                    parse_mode="Markdown"
-                )
-        else:
-            await update.message.reply_text(
-                f"❌ Không parse được ảnh.\nResponse: {str(data)[:300]}"
-            )
-
-    except requests.Timeout:
-        await update.message.reply_text("⏱ Timeout — thử lại sau 30 giây.")
     except Exception as e:
         logger.error(f"Error: {e}")
         await update.message.reply_text(f"❌ Lỗi: {str(e)}")
